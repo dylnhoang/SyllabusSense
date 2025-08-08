@@ -1,13 +1,16 @@
-import pymupdf
+import fitz
 
 #extracts text from uploaded files
 def parse_file(my_path: str):
-    doc = pymupdf.open(my_path)
+    doc = fitz.open(my_path)
 
     res = ""
 
     for page in doc:
-        text = page.get_text()
-        res += text
+        blocks = page.get_text("blocks")
+        for b in blocks:
+            res += b[4]  # b[4] contains the text
+
+    print(res)
         
     return res
