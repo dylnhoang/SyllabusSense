@@ -3,8 +3,8 @@ import spacy
 from spacy.matcher import Matcher
 
 nlp = spacy.load("en_core_web_sm")
-
 matcher = Matcher(nlp.vocab)
+
 matcher.add("EXAM", [[{"LOWER": {"IN": ["exam", "midterm", "final"]}}]])
 matcher.add("HOMEWORK", [[{"LOWER": {"IN": ["homework", "assignment", "hw"]}}]])
 matcher.add("PROJECT", [[{"LOWER": {"IN": ["project", "proposal", "report", "presentation"]}}]])
@@ -12,6 +12,7 @@ matcher.add("QUIZ", [[{"LOWER": "quiz"}]])
 matcher.add("LAB", [[{"LOWER": "lab"}]])
 matcher.add("READING", [[{"LOWER": {"IN": ["reading", "chapter", "ch."]}}]])
 matcher.add("DUE", [[{"LOWER": {"IN": ["due", "deadline", "submit"]}}]])
+matcher.add("EXAM_NUM", [[{"LOWER": "exam"}, {"IS_DIGIT": True}]])
 
 date_patterns = [
     r'\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|'
@@ -36,50 +37,74 @@ date_patterns = [
 
 combined_pattern = '|'.join(date_patterns)
 
-def classify_context(text: str, date_span: tuple):
-    start, end = date_span
+def classify_context(text: str, date_str: str):
     doc = nlp(text)
+    
+    if date_str not in text:
+        return None
 
     date_token_i = None
     for i, token in enumerate(doc):
-        for i, token in enumerate(doc):
-            if token.idx == start:
-                date_token_i = i
-                break
-        if date_token_i is None:
-            return None
+        if date_str in token.text:
+            date_token_i = i
+            break
+    if date_token_i is None:
+        return None
+    
+    matches = matcher(doc)
+    
+    closest_match = None
+    min_dist = float('inf')
+
+    for match_id, start, end in matches:
+        dist = min(abs(start - date_token_i), abs(end - 1 - date_token_i))
+        if dist <= 10 and dist < min_dist:  
+            min_dist = dist
+            closest_match = (match_id, start, end)
         
-        window_start = max(0, date_token_i - 10)
-        window_end = min(len(doc), date_token_i + 10)
-        context_span = doc[window_start : window_end]
+    event_type = None
+    title = None
+    if closest_match:
+        match_id, start, end = closest_match
+        event_type = nlp.vocab.strings[match_id]
+        title = doc[start:end].text
 
-        matches = matcher(context_span)
-        event_type = None
-        if matches:
-            match_id, start, end = matches[0]
-            event_type = nlp.vocab.strings[match_id]
+    if not title:
+        noun_chunks = [nc.text for nc in doc.noun_chunks]
+        title = noun_chunks[0] if noun_chunks else text.strip()
 
-        noun_chunks = [nc.text for nc in context_span.noun_chunks]
-        title = noun_chunks[0] if noun_chunks else context_span.text.strip()
-
-        return {
-            "type": event_type,
-            "title": title,
-            "context": context_span.text.strip(),
-        }
+    return {
+        "type": event_type,
+        "title": title,
+        "context": text.strip(),
+    }
 
 def parse_dates(text: str):
+    blocks = text.splitlines()
     res = []
 
-    for match in re.finditer(combined_pattern, text):
-        date_str = match.group(0)
-        date_span = match.span()
+    for block in blocks:
+        for match in re.finditer(combined_pattern, block):
+            date_str = match.group(0)
 
-        ctx_info = classify_context(text, date_span) or {}
+            ctx_info = classify_context(block, date_str) or {}
 
-        res.append({
-            "date_raw": date_str,
-            "context": ctx_info.get("context", "")
-        })
+            res.append({
+                "date_raw": date_str,
+                "context": ctx_info.get("context", ""),
+                "type": ctx_info.get("type"),
+                "title": ctx_info.get("title")
+            })
+
+    seen = set()
+    final = []
+    for item in res:
+        key = (item["date_raw"], item["context"])
+        if key not in seen and item["context"] and item["type"]:
+            final.append(item)
+            seen.add(key)
+
+    return final
+
 
 
