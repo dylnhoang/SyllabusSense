@@ -38,6 +38,8 @@ TIME_RANGE_RE = (
     r"(?P<t2>\d{1,2}(?::\d{2})?)\s*(?P<a2>a\.?m\.?|p\.?m\.?)?"
 )
 
+RANGE_ANY_RE = re.compile(TIME_RANGE_RE, flags=re.I)
+
 LINE_DAYS_RE = re.compile(rf"^\s*(?P<days>{DAYS_BLOCK_RE})\s*$", flags=re.I)
 LINE_TIME_RE = re.compile(rf"^\s*(?P<trange>{TIME_RANGE_RE})\s*$", flags=re.I)
 LINE_LOC_RE  = re.compile(r"^\s*(?:Location[: ]*)?(?P<loc>(?:TBD|Rm|Room|Hall|HALL|CH|Fowler|Science|Building|Bldg)[^\n,;]*)\s*$", flags=re.I)
@@ -61,12 +63,23 @@ COURSE_LINE_RE = re.compile(
 )
 
 CODE_RE = re.compile(
-    r'\b([A-Z][A-Za-z&/]{1,15})\s*[:\-]?\s*(\d{2,3}[A-Za-z\-]*)\b'  # e.g., PHYS 110, Math 212
+    r'\b([A-Z][A-Za-z&/]{1,15})\s*[:\-]?\s*(\d{1,3}[A-Za-z\-]*)\b'
 )
 TERM_RE = re.compile(r'\b(Fall|Spring|Summer|Winter)\s+\d{4}\b', re.I)
 NOISE_RE = re.compile(r'(course\s*page|canvas|syllabus\s*page|policy|resources)', re.I)
 
 OFFICE_BLOCK_RE = re.compile(r"^\s*Office\s*Hours\s*:", flags=re.I|re.M)
+OFFICE_RE   = re.compile(r'\b(office|student)\s*hours\b', re.I)
+APPT_RE     = re.compile(r'\b(appointments?|by\s+appointment|drop-?in)\b', re.I)
+SERVICE_RE  = re.compile(r'\b(M[-/–]F|Mon(?:day)?\s*-\s*Fri(?:day)?)\b.*\b\d{1,2}(:\d{2})?\s*(a\.?m\.?|p\.?m\.?)\b.*\b\d{1,2}(:\d{2})?\s*(a\.?m\.?|p\.?m\.?)\b', re.I)
+SUPPORT_HINTS = re.compile(r'\b(chat|research support|library|tlrs|tutor|hotline|counseling|help\s*desk)\b', re.I)
+
+SECTION_START_RE = re.compile(
+    r'^(?P<hdr>(Office\s*Hours|Student\s*Hours|Instructor\s*Hours|Advising\s*Hours|Availability))\s*:\s*$',
+    re.I | re.M
+)
+# A simple “next header” or blank-line delimiter
+NEXT_HEADER_OR_BLANK_RE = re.compile(r'^\s*\S[^:\n]*:\s*$|^\s*$', re.M)
 
 # Map many day spellings/abbrevs to canonical weekday codes
 DAY_MAP = {
@@ -91,6 +104,7 @@ COMPOSITES = {
     "mtwrf": ["MO","TU","WE","TH","FR"],
     "m/t/w/r/f": ["MO","TU","WE","TH","FR"],
     "mtwthf": ["MO","TU","WE","TH","FR"],
+    "m-f": ["MO","TU","WE","TH","FR"],
 }
 
 def _norm_ampm(s: Optional[str]) -> Optional[str]:
@@ -111,24 +125,50 @@ def normalize_text(t: str) -> str:
     t = t.replace("\r\n", "\n").replace("\r", "\n")
     return t
 
-def _to_24h(hm: str, ampm_left: Optional[str], ampm_right: Optional[str]) -> str:
-    ampm = _norm_ampm(ampm_right) or _norm_ampm(ampm_left)
+def _to_24h_with_ampm(hm: str, ampm: Optional[str]) -> str:
+    def _norm(s):
+        if not s: return None
+        s = s.lower().replace('.', '')
+        return 'am' if s.startswith('a') else ('pm' if s.startswith('p') else None)
+
+    am = _norm(ampm)
     h, m = (hm.split(":") + ["00"])[:2]
     h, m = int(h), int(m)
-
-    # If we got explicit am/pm, convert normally:
-    if ampm == "am":
+    if am == 'am':
         if h == 12: h = 0
-    elif ampm == "pm":
+    elif am == 'pm':
         if h < 12: h += 12
-    else:
-        # Heuristic for no am/pm:
-        # - If 1–7 → assume afternoon classes if your campus mostly schedules then (13–19)
-        # - Else leave as-is (8–12 → morning; 13–23 already 24h)
-        if 1 <= h <= 7:
-            h += 12
-
     return f"{h:02d}:{m:02d}"
+
+def _resolve_range(t1, a1, t2, a2):
+    """
+    Rule:
+      - If only one side has AM/PM, use that for BOTH sides.
+      - If neither side has AM/PM and end<=start, assume the END is PM (common class case).
+    """
+    # Propagate am/pm if present on only one side
+    left_ampm  = a1 or a2
+    right_ampm = a2 or a1
+
+    s = _to_24h_with_ampm(t1, left_ampm)
+    e = _to_24h_with_ampm(t2, right_ampm)
+
+    sh, sm = map(int, s.split(':'))
+    eh, em = map(int, e.split(':'))
+
+    # If neither side had AM/PM and the range looks inverted, bump end into PM
+    if (a1 is None) and (a2 is None):
+        if (eh, em) <= (sh, sm) and sh < 12:
+            eh += 12
+            e = f"{eh:02d}:{em:02d}"
+
+    return s, e
+
+def _gather_extra_ranges(after_text: str):
+    return list(RANGE_ANY_RE.finditer(after_text))
+
+def _has_days(s: str) -> bool:
+    return bool(re.search(rf'\b{DAY_TOKEN_RE}\b', s, flags=re.I))
 
 def _explode_days(days_text: str) -> List[str]:
     txt = days_text.strip()
@@ -166,6 +206,12 @@ def _good_line(line: str) -> bool:
     # avoid lines that are just navigation or URLs
     if len(line.strip()) < 6: return False
     return True
+
+def _skip_nonclass_line(line: str) -> bool:
+    if OFFICE_RE.search(line): return True
+    if APPT_RE.search(line): return True
+    if SERVICE_RE.search(line) and SUPPORT_HINTS.search(line): return True
+    return False
 
 def _fallback_line_pairs(lines: list[str]):
     """Yield (days_text, time_match, location_or_None) from adjacent lines."""
@@ -251,13 +297,37 @@ def _looks_like_office_hours(ctx: str) -> bool:
     return bool(re.search(r"office\s*hours", ctx, flags=re.I))
 
 def _is_in_office_block(text: str, match_start: int) -> bool:
-    # Find nearest "Office Hours:" above; stop block at blank line or next section header
-    block_start = [m.start() for m in OFFICE_BLOCK_RE.finditer(text) if m.start() <= match_start]
-    if not block_start: return False
-    block_start = max(block_start)
-    # crude end: next blank line or next line ending with colon
-    after = text[block_start:match_start]
-    return True  # we are within the office hours area
+    # Find the nearest "Office Hours:" before this match
+    last = None
+    for m in OFFICE_BLOCK_RE.finditer(text):
+        if m.start() <= match_start:
+            last = m.start()
+        else:
+            break
+    if last is None:
+        return False
+    # If the match is very close to the Office Hours header, treat it as inside that block
+    return (match_start - last) < 400
+
+def _compute_skip_spans(text: str):
+    """
+    Find text spans for Office/Student Hours sections so we can ignore
+    ANY matches inside those blocks (even if the lines look like 'M 3-4pm').
+    """
+    spans = []
+    for m in SECTION_START_RE.finditer(text):
+        start = m.end()
+        # find end: next header-like line or the next blank line after a non-empty line
+        nxt = NEXT_HEADER_OR_BLANK_RE.search(text, start)
+        end = nxt.start() if nxt else len(text)
+        spans.append((start, end))
+    return spans
+
+def _in_spans(pos: int, spans):
+    for s, e in spans:
+        if s <= pos < e:
+            return True
+    return False
 
 LAB_LINE_RE = re.compile(
     r"Lab\s+Sections?:\s*(?P<body>.+?)\s*(\((?P<allloc>all in [^)]+)\))?\s*$",
@@ -289,8 +359,7 @@ def _parse_labs_block(text: str) -> List[Meeting]:
 
             a1, a2 = item.group("a1"), item.group("a2")
             t1, t2 = item.group("t1"), item.group("t2")
-            start_24h = _to_24h(t1, a1, a2)
-            end_24h   = _to_24h(t2, a1, a2)
+            start_24h, end_24h = _resolve_range(t1, a1, t2, a2)
 
             # try to capture a per-item room (rare), else shared "(all in HSC 109)"
             loc = None
@@ -320,40 +389,90 @@ def parse_class_schedule(raw_text: str) -> CourseSchedule:
     text = normalize_text(raw_text)
     meetings = []
 
+    office_spans = _compute_skip_spans(text)
+
     # Pass A: explicit schedule lines
     for m in SCHEDULE_LINE_RE.finditer(text):
-        if _is_in_office_block(text, m.start()):
+        # skip if inside office-hour block
+        if _in_spans(m.start(), office_spans):
             continue
+
+        # get full line text for filtering
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        line_end = text.find("\n", m.end())
+        line_end = len(text) if line_end == -1 else line_end
+        line_text = text[line_start:line_end]
+
+        if _skip_nonclass_line(line_text):
+            continue
+
         days_text = m.group("days").strip()
         days = _explode_days(days_text)
 
         a1, a2 = m.group("a1"), m.group("a2")
         t1, t2 = m.group("t1"), m.group("t2")
-        start_24h = _to_24h(t1, a1, a2)
-        end_24h   = _to_24h(t2, a1, a2)
+        start_24h, end_24h = _resolve_range(t1, a1, t2, a2)
 
         loc = m.group("loc")
         if loc:
             loc = re.sub(r"\s+", " ", loc).strip(" ,;.")
-            if loc.upper() == "TBD": loc = "TBD"
+            if loc.upper() == "TBD":
+                loc = "TBD"
 
         meetings.append(Meeting(days_text, days, start_24h, end_24h, loc))
+
+        # --- handle extra ranges on same/next line ---
+        first_range_text = m.group("trange")
+        first_pos = line_text.find(first_range_text)
+        tail_same_line = (
+            line_text[first_pos + len(first_range_text) :]
+            if first_pos != -1
+            else ""
+        )
+
+        next_line = ""
+        nl_pos = line_end + 1
+        nl2_pos = text.find("\n", nl_pos)
+        if nl_pos < len(text):
+            next_line = text[nl_pos : (len(text) if nl2_pos == -1 else nl2_pos)].strip()
+
+        tail = tail_same_line
+        if next_line and not _has_days(next_line) and not _skip_nonclass_line(next_line):
+            tail = f"{tail} {next_line}"
+
+        for mm in _gather_extra_ranges(tail):
+            s2, e2 = _resolve_range(
+                mm.group("t1"), mm.group("a1"), mm.group("t2"), mm.group("a2")
+            )
+            meetings.append(Meeting(days_text, days, s2, e2, loc))
 
     # Pass B: fallback line-pair stitching
     lines = [ln.strip() for ln in text.splitlines()]
     for days_text, mt, loc in _fallback_line_pairs(lines):
+        # check office-hour span on this match too
+        if _in_spans(mt.start(), office_spans):
+            continue
+
+        candidate_line = f"{days_text} {mt.group('t1')}-{mt.group('t2')} {loc or ''}"
+        if _skip_nonclass_line(candidate_line):
+            continue
+
         days = _explode_days(days_text)
-        a1, a2 = mt.group("a1"), mt.group("a2")
-        t1, t2 = mt.group("t1"), mt.group("t2")
-        start_24h = _to_24h(t1, a1, a2)
-        end_24h   = _to_24h(t2, a1, a2)
+        start_24h, end_24h = _resolve_range(
+            mt.group("t1"), mt.group("a1"), mt.group("t2"), mt.group("a2")
+        )
+
         if loc:
             loc = re.sub(r"\s+", " ", loc).strip(" ,;.")
-            if loc.upper() == "TBD": loc = "TBD"
+            if loc.upper() == "TBD":
+                loc = "TBD"
+
         meetings.append(Meeting(days_text, days, start_24h, end_24h, loc))
 
-    # Dedupe
+    # Dedupe & sanity filter
+    meetings = [m for m in meetings if time_makes_sense(m)]
     meetings = _dedupe_meetings(meetings)
+
     return CourseSchedule(course_name=_guess_course_name(text), meetings=meetings)
 
 
@@ -385,3 +504,8 @@ def exam_window_from_schedule(item_course: str, schedule: CourseSchedule, exam_y
         m = schedule.meetings[0]
         return f"{exam_ymd}T{m.start_24h}:00", f"{exam_ymd}T{m.end_24h}:00"
     return None, None
+
+def time_makes_sense(meeting: Meeting) -> bool:
+    sh, sm = map(int, meeting.start_24h.split(':'))
+    eh, em = map(int, meeting.end_24h.split(':'))
+    return (eh, em) > (sh, sm)
