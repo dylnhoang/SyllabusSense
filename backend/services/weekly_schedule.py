@@ -38,14 +38,17 @@ TIME_RANGE_RE = (
     r"(?P<t2>\d{1,2}(?::\d{2})?)\s*(?P<a2>a\.?m\.?|p\.?m\.?)?"
 )
 
+LINE_DAYS_RE = re.compile(rf"^\s*(?P<days>{DAYS_BLOCK_RE})\s*$", flags=re.I)
+LINE_TIME_RE = re.compile(rf"^\s*(?P<trange>{TIME_RANGE_RE})\s*$", flags=re.I)
+LINE_LOC_RE  = re.compile(r"^\s*(?:Location[: ]*)?(?P<loc>(?:TBD|Rm|Room|Hall|HALL|CH|Fowler|Science|Building|Bldg)[^\n,;]*)\s*$", flags=re.I)
+
 # Typical schedule lines we’ll match:
 # "Meets: MWF 10:00–10:50 AM (Room 101)"
 # "Lecture Tu/Th 1:00-2:15pm, Fowler 302"
 # "Class: Tuesday and Thursday 13:00–14:15, CH 120"
 SCHEDULE_LINE_RE = re.compile(
     rf"(?P<prefix>\b(Meets|Meeting|Class|Class Meeting|Lecture|Times?)\b[: ]*)?"
-    rf"(?P<days>{DAY_TOKEN_RE})(?:[ ,/]*(?P<days2>{DAY_TOKEN_RE}))?"  # optional second block like "TTh/Fr"
-    rf"[ ,]*"
+    rf"(?P<days>{DAYS_BLOCK_RE})[ ,]*"
     rf"(?P<trange>{TIME_RANGE_RE})"
     rf"(?:[ ,;|-]+(?P<loc>(?:Rm|Room|Lab|Hall|HALL|CH|Fowler|Science|Building|Bldg|Online|Zoom|Location|TBD)[^,\n;]*))?",
     flags=re.IGNORECASE
@@ -95,6 +98,18 @@ def _norm_ampm(s: Optional[str]) -> Optional[str]:
         return None
     s = s.lower().replace(".", "")
     return {"am":"am", "a m":"am", "a":"am", "pm":"pm", "p m":"pm", "p":"pm"}.get(s, s)
+
+def normalize_text(t: str) -> str:
+    # unify dashes/spaces
+    t = (t.replace("\u2013", "-")
+           .replace("\u2014", "-")
+           .replace("\u2212", "-")
+           .replace("\u00A0", " "))   # NBSP → space
+    # collapse triple spaces
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    # trim CRLF noise
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    return t
 
 def _to_24h(hm: str, ampm_left: Optional[str], ampm_right: Optional[str]) -> str:
     ampm = _norm_ampm(ampm_right) or _norm_ampm(ampm_left)
@@ -151,6 +166,28 @@ def _good_line(line: str) -> bool:
     # avoid lines that are just navigation or URLs
     if len(line.strip()) < 6: return False
     return True
+
+def _fallback_line_pairs(lines: list[str]):
+    """Yield (days_text, time_match, location_or_None) from adjacent lines."""
+    for i, ln in enumerate(lines):
+        md = LINE_DAYS_RE.match(ln)
+        if not md: 
+            continue
+        # look within next 2 lines for time
+        for j in (i+1, i+2):
+            if j < len(lines):
+                mt = LINE_TIME_RE.match(lines[j])
+                if mt:
+                    loc = None
+                    # optional location on same or next line
+                    for k in (j, j+1):
+                        if k < len(lines):
+                            ml = LINE_LOC_RE.match(lines[k])
+                            if ml:
+                                loc = ml.group("loc").strip(" ,;.")
+                                break
+                    yield md.group("days"), mt, loc
+                    break
 
 def _guess_course_name(text: str) -> Optional[str]:
     # Normalize weird dashes and whitespace
@@ -280,41 +317,45 @@ def _dedupe_meetings(meetings):
 
 # ---------- Main parser ----------
 def parse_class_schedule(raw_text: str) -> CourseSchedule:
-    meetings: List[Meeting] = []
-    # 3a) Labs first (so they don't get swallowed oddly)
-    meetings.extend(_parse_labs_block(raw_text))
+    text = normalize_text(raw_text)
+    meetings = []
 
-    # 3b) Lectures and other lines
-    for m in SCHEDULE_LINE_RE.finditer(raw_text):
-        line_start = raw_text.rfind("\n", 0, m.start()) + 1
-        line_text = raw_text[line_start: raw_text.find("\n", m.end()) if raw_text.find("\n", m.end())!=-1 else len(raw_text)]
-        if _looks_like_office_hours(raw_text[line_start: m.end()]) or _is_in_office_block(raw_text, m.start()):
+    # Pass A: explicit schedule lines
+    for m in SCHEDULE_LINE_RE.finditer(text):
+        if _is_in_office_block(text, m.start()):
             continue
-
-        days_text = m.group("days")
+        days_text = m.group("days").strip()
         days = _explode_days(days_text)
 
         a1, a2 = m.group("a1"), m.group("a2")
-        start_24h = _to_24h(m.group("t1"), a1, a2)
-        end_24h   = _to_24h(m.group("t2"), a1, a2)
+        t1, t2 = m.group("t1"), m.group("t2")
+        start_24h = _to_24h(t1, a1, a2)
+        end_24h   = _to_24h(t2, a1, a2)
 
         loc = m.group("loc")
-        if not loc:
-            # try a generic room on the same line
-            rm = ROOM_RE.search(line_text)
-            if rm: loc = rm.group(1)
+        if loc:
+            loc = re.sub(r"\s+", " ", loc).strip(" ,;.")
+            if loc.upper() == "TBD": loc = "TBD"
 
-        meetings.append(Meeting(
-            days_text=days_text.strip(),
-            days=days,
-            start_24h=start_24h,
-            end_24h=end_24h,
-            location=(re.sub(r"\s+", " ", loc).strip(" ,;.") if loc else None)
-        ))
+        meetings.append(Meeting(days_text, days, start_24h, end_24h, loc))
 
+    # Pass B: fallback line-pair stitching
+    lines = [ln.strip() for ln in text.splitlines()]
+    for days_text, mt, loc in _fallback_line_pairs(lines):
+        days = _explode_days(days_text)
+        a1, a2 = mt.group("a1"), mt.group("a2")
+        t1, t2 = mt.group("t1"), mt.group("t2")
+        start_24h = _to_24h(t1, a1, a2)
+        end_24h   = _to_24h(t2, a1, a2)
+        if loc:
+            loc = re.sub(r"\s+", " ", loc).strip(" ,;.")
+            if loc.upper() == "TBD": loc = "TBD"
+        meetings.append(Meeting(days_text, days, start_24h, end_24h, loc))
+
+    # Dedupe
     meetings = _dedupe_meetings(meetings)
+    return CourseSchedule(course_name=_guess_course_name(text), meetings=meetings)
 
-    return CourseSchedule(course_name=_guess_course_name(raw_text), meetings=meetings)
 
 # ---------- Helpers you’ll likely want ----------
 def meetings_to_rrule(meet: Meeting, dtstart_ymd: str) -> Dict[str, Any]:
