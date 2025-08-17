@@ -14,6 +14,7 @@ matcher.add("READING", [[{"LOWER": {"IN": ["reading", "chapter", "ch."]}}]])
 matcher.add("DUE", [[{"LOWER": {"IN": ["due", "deadline", "submit"]}}]])
 matcher.add("EXAM_NUM", [[{"LOWER": "exam"}, {"IS_DIGIT": True}]])
 
+
 date_patterns = [
     # Day-first with ordinal + comma: "27th August, 2024"
     r'\b\d{1,2}(?:st|nd|rd|th)\s+'
@@ -61,6 +62,28 @@ date_patterns = [
 # Compile once with IGNORECASE
 combined_pattern = re.compile("|".join(date_patterns), flags=re.IGNORECASE)
 
+def _slice_text_dir(doc, kw_start, kw_end, date_start, date_end, direction, left_pad=4, right_pad=6):
+    """
+    direction: -1 = keyword BEFORE date, 0 = overlap, +1 = keyword AFTER date
+    Returns a compact token slice that covers only keyword→date (or date→keyword).
+    """
+    if direction <= 0:  # keyword before (or overlapping) → [keyword..date]
+        s = max(0, kw_start - left_pad)
+        e = min(len(doc), date_end + right_pad)
+    else:               # keyword after → [date..keyword]
+        s = max(0, date_start - left_pad)
+        e = min(len(doc), kw_end + right_pad)
+
+    text = doc[s:e].text
+
+    # Stop at a new header line like "Final:" so we don't mix events
+    # Cut at a newline if the next line starts with "Word:" within ~20 chars.
+    import re as _re
+    text = _re.split(r'\n(?=[A-Z][^\n]{0,20}:)', text)[0]
+
+    # Whitespace tidy
+    return _re.sub(r'[ \t]+', ' ', text).strip()
+
 TOKEN_WINDOW = 5  # max distance in tokens from the date to consider a keyword "nearby"
 
 def classify_context(window_text: str, start_char: int, end_char: int, k: int = TOKEN_WINDOW):
@@ -102,29 +125,29 @@ def classify_context(window_text: str, start_char: int, end_char: int, k: int = 
     # Build title from a compact slice that surely contains BOTH keyword and date
     cover_start = max(0, min(ms, ds) - 3)
     cover_end   = min(len(doc), max(me, de) + 6)
-    cover_text  = doc[cover_start:cover_end].text
+    cover_text = _slice_text_dir(doc, ms, me, ds, de, direction)
 
     # Prefer "due ... at ..." for DUE
     title = None
     if event_type == "DUE":
         m_due = re.search(r'\b(due|deadline|submit)\b.*?(?:\bat\b.*)?', cover_text, flags=re.I)
         if m_due:
-            title = m_due.group(0)
+            title = m_due.group(0).strip().rstrip('.')
 
     if not title:
         kw_text   = doc[ms:me].text
-        date_text = window_text[start_char:end_char]
-        # Smallest clause containing both keyword and date
+        date_text = window_text[start_char:end_char]  # exact matched date in THIS window
+        # Smallest clause inside the directed slice that contains both keyword and date
         clauses = re.split(r'[.;:—–-]|,(?!\d)', cover_text)
         cands = [c.strip() for c in clauses if (kw_text.lower() in c.lower() and date_text in c)]
-        title = (min(cands, key=len) if cands else kw_text)
+        title = (min(cands, key=len) if cands else kw_text).rstrip('.')
 
-    title = re.sub(r'\s+', ' ', title).strip().rstrip('.')
+    title = re.sub(r'\s+', ' ', title).strip()
 
     return {
         "type": event_type,
         "title": title,
-        "context": cover_text.strip()
+        "context": cover_text
     }
 
 
