@@ -38,7 +38,6 @@ TIME_RANGE_RE = (
     r"(?:-|–|—|\bto\b)\s*"
     r"(?P<t2>\d{1,2}(?::\d{2})?)\s*(?P<a2>a\.?m\.?|p\.?m\.?)?"
 )
-
 RANGE_ANY_RE = re.compile(TIME_RANGE_RE, flags=re.I)
 
 LINE_DAYS_RE = re.compile(rf"^\s*(?P<days>{DAYS_BLOCK_RE})\s*$", flags=re.I)
@@ -54,7 +53,7 @@ LINE_LOC_RE  = re.compile(
 # "Class: Tuesday and Thursday 13:00–14:15, CH 120"
 SCHEDULE_LINE_RE = re.compile(
     rf"(?P<prefix>\b(Meets|Meeting|Class|Class Meeting|Lecture|Times?)\b[: ]*)?"
-    rf"(?P<days>{DAYS_BLOCK_RE})\s*[: ,;-]*\s*"
+    rf"(?P<days>{DAYS_BLOCK_RE})[ ,]*"
     rf"(?P<trange>{TIME_RANGE_RE})"
     rf"(?:[ ,;|-]+(?P<loc>(?:Rm|Room|Lab|Hall|HALL|CH|Fowler|Science|Building|Bldg|Online|Zoom|Location|TBD)[^,\n;]*))?",
     flags=re.IGNORECASE
@@ -73,7 +72,7 @@ NOISE_RE = re.compile(r'(course\s*page|canvas|syllabus\s*page|policy|resources)'
 
 # Office/support detection
 OFFICE_BLOCK_RE = re.compile(r"^\s*Office\s*Hours\s*:", flags=re.I|re.M)
-OFFICE_RE = re.compile(r'\b(office|student|instructor)\s*hours\b', re.I)
+OFFICE_RE = re.compile(r'\b(office|student|instructor)\s*hours\b|\bOH\b', re.I)
 APPT_RE     = re.compile(r'\b(appointments?|by\s+appointment|drop-?in)\b', re.I)
 SERVICE_RE  = re.compile(
     r'\b(M[-/–]F|Mon(?:day)?\s*-\s*Fri(?:day)?)\b.*\b\d{1,2}(:\d{2})?\s*(a\.?m\.?|p\.?m\.?)\b.*\b\d{1,2}(:\d{2})?\s*(a\.?m\.?|p\.?m\.?)\b',
@@ -82,12 +81,15 @@ SERVICE_RE  = re.compile(
 SUPPORT_HINTS = re.compile(r'\b(chat|research support|library|tlrs|tutor|hotline|counseling|help\s*desk)\b', re.I)
 
 # Section headers that imply a block kind
+# NOTE: we accept Office/Student/Instructor Hours with or without a trailing colon,
+# but we'll still tighten the span to the next blank/header line to avoid overreach.
 SECTION_KIND_HEADERS = {
     "OFFICE":     re.compile(r'^\s*((Office|Student|Instructor)\s*Hours|OH|Availability)\b.*$', re.I | re.M),
-    "LAB":        re.compile(r'^\s*(Labs?|Laborator(?:y|ies)|Studio)\b.*$',   re.I | re.M),
-    "DISCUSSION": re.compile(r'^\s*(Discussion|Recitation|Sections?)\b.*$',   re.I | re.M),
-    "CLASS":      re.compile(r'^\s*(Class\s*Meetings?|Meeting\s*Times?|Lecture|Schedule)\b.*$', re.I | re.M),
+    "LAB":        re.compile(r'^\s*(Labs?|Laborator(?:y|ies)|Studio)\s*:\s*$',   re.I | re.M),
+    "DISCUSSION": re.compile(r'^\s*(Discussion|Recitation|Sections?)\s*:\s*$',   re.I | re.M),
+    "CLASS":      re.compile(r'^\s*(Class\s*Meetings?|Meeting\s*Times?|Lecture|Schedule)\s*:\s*$', re.I | re.M),
 }
+# A simple “next header” or blank-line delimiter
 NEXT_HEADER_OR_BLANK_RE = re.compile(r'^\s*\S[^:\n]*:\s*$|^\s*$', re.M)
 
 # Kind hints (word-level)
@@ -95,7 +97,8 @@ LAB_HINT_RE        = re.compile(r'\b(lab|laborator(?:y|ies)|studio)\b', re.I)
 DISC_HINT_RE       = re.compile(r'\b(discussion|recitation|precept|tutorial|section)\b', re.I)
 LECTURE_HINT_RE    = re.compile(r'\b(lecture|class|seminar|meeting|meets)\b', re.I)
 
-PAIR_RE = re.compile(rf"(?P<days>{DAY_TOKEN_RE})\s*(?P<trange>{TIME_RANGE_RE})", re.I)
+# Peek-behind context to help classify office hours even when the time line has no keywords
+CONTEXT_WINDOW_CHARS = 200
 
 # Day maps
 DAY_MAP = {
@@ -107,7 +110,6 @@ DAY_MAP = {
     "sa": "SA", "sat": "SA", "saturday": "SA",
     "su": "SU", "sun": "SU", "sunday": "SU",
 }
-
 COMPOSITES = {
     "mwf": ["MO","WE","FR"],
     "m/w/f": ["MO","WE","FR"],
@@ -160,7 +162,6 @@ def _resolve_range(t1, a1, t2, a2):
     """
     left_ampm  = a1 or a2
     right_ampm = a2 or a1
-
     s = _to_24h_with_ampm(t1, left_ampm)
     e = _to_24h_with_ampm(t2, right_ampm)
 
@@ -169,14 +170,9 @@ def _resolve_range(t1, a1, t2, a2):
 
     # No AM/PM provided and inverted → bump end into PM (e.g., 1:30-2:20)
     if (a1 is None) and (a2 is None):
-        # bump likely afternoon hours (1–7) for BOTH endpoints
-        if 1 <= sh <= 7: sh += 12
-        if 1 <= eh <= 7: eh += 12
         if (eh, em) <= (sh, sm) and sh < 12:
             eh += 12
-        s = f"{sh:02d}:{sm:02d}"
-        e = f"{eh:02d}:{em:02d}"
-
+            e = f"{eh:02d}:{em:02d}"
     return s, e
 
 def _gather_extra_ranges(after_text: str):
@@ -230,36 +226,40 @@ def _iter_lines_with_offsets(text: str) -> List[Tuple[int, int, str]]:
     return out
 
 def _fallback_line_pairs_with_pos(text: str):
+    """
+    Yield (days_text, time_match, location_or_None, days_line_start_offset, synthetic_line_text)
+    """
     lines = _iter_lines_with_offsets(text)
+    # Just the visible text for regex line-based matches:
     plain = [ln for _, _, ln in lines]
 
     for i, ln in enumerate(plain):
         md = LINE_DAYS_RE.match(ln)
         if not md:
             continue
-
-        # only look at the immediate next line; bail if it contains more days
-        j = i + 1
-        if j < len(plain):
-            if _has_days(plain[j]):
-                continue
-            mt = LINE_TIME_RE.match(plain[j])
-            if mt:
-                loc = None
-                # optional location same/next line
-                k = j + 1
-                if k < len(plain):
-                    ml = LINE_LOC_RE.match(plain[k])
-                    if ml:
-                        loc = ml.group("loc").strip(" ,;.")
-                days_text = md.group("days")
-                start_off = lines[i][0]
-                synthetic_line = f"{days_text} {mt.group('t1')}-{mt.group('t2')} {loc or ''}".strip()
-                yield days_text, mt, loc, start_off, synthetic_line
+        # look within next 2 visible lines for a time
+        for j in (i+1, i+2):
+            if j < len(plain):
+                mt = LINE_TIME_RE.match(plain[j])
+                if mt:
+                    loc = None
+                    # optional location same/next line
+                    for k in (j, j+1):
+                        if k < len(plain):
+                            ml = LINE_LOC_RE.match(plain[k])
+                            if ml:
+                                loc = ml.group("loc").strip(" ,;."); break
+                    days_text = md.group("days")
+                    # use the start offset of the days line
+                    start_off = lines[i][0]
+                    synthetic_line = f"{days_text} {mt.group('t1')}-{mt.group('t2')} {loc or ''}".strip()
+                    yield days_text, mt, loc, start_off, synthetic_line
+                    break
 
 def _guess_course_name(text: str) -> Optional[str]:
     norm = text.replace('—', '-').replace('–', '-')
     lines = [l.strip() for l in norm.splitlines() if l.strip()]
+    # Only scan the top of the doc (headers), but give some slack
     head = lines[:80]
 
     best = None
@@ -283,25 +283,34 @@ def _guess_course_name(text: str) -> Optional[str]:
             continue
 
         dept, num = m.groups()
+        # Title = remainder of line after code; if empty, try next line
         title = _clean(ln[m.end():]) or (_clean(head[i+1]) if i+1 < len(head) and _good_line(head[i+1]) else '')
         cand = _clean(f"{dept} {num} {title}")
+
+        # score: presence of term, has title words, nearer to top is better
         score = 2
         if TERM_RE.search(ln) or TERM_RE.search(title): score += 1
         if len(title.split()) >= 2: score += 1
-        score += max(0, 5 - i//5)
+        score += max(0, 5 - i//5)  # slight preference to earlier lines
+
         if score > best_score:
             best, best_score = cand, score
 
+    # Final cleanup: drop trailing term if you don’t want it in the name
     if best:
-        best = TERM_RE.sub('', best)
+        # If you want to keep the term, comment out the next two lines
+    #     best = TERM_RE.sub('', best)
         best = _clean(best)
         return best
 
+    # Fallback: any code anywhere
     m = CODE_RE.search(norm)
     if m:
         return _clean(f"{m.group(1)} {m.group(2)}")
+
     return None
 
+# ----- Section-kind spans & classification -----
 def _find_all_headers(text: str) -> List[Tuple[int, str]]:
     """Return sorted list of (start_index, KIND) for all section-kind headers."""
     headers = []
@@ -313,15 +322,21 @@ def _find_all_headers(text: str) -> List[Tuple[int, str]]:
 
 def _compute_kind_spans(text: str):
     """
-    Build non-overlapping spans: each header covers until the *next* header.
-    This is robust to blank lines after the header.
+    Build non-overlapping spans: each header covers until the *next* header
+    OR the next 'header-like' line or blank line after some content.
+    This keeps 'Office Hours' blocks tight even without a colon.
     """
     spans = []
     headers = _find_all_headers(text)  # [(pos, kind), ...] sorted
     if not headers:
         return spans
     for i, (start, kind) in enumerate(headers):
+        # default end: next header or EOF
         end = headers[i+1][0] if i+1 < len(headers) else len(text)
+        # tighten: if a header-like or blank line occurs sooner, use that
+        nxt = NEXT_HEADER_OR_BLANK_RE.search(text, start + 1)
+        if nxt and nxt.start() < end:
+            end = nxt.start()
         spans.append((start, end, kind))
     return spans
 
@@ -331,24 +346,29 @@ def _kind_at(pos: int, spans):
             return k
     return None
 
-def _classify_kind(line_text: str, loc: Optional[str], span_kind: Optional[str]) -> str:
-    # 1) Section signal (highest priority)
+def _classify_kind(line_text: str, loc: Optional[str], span_kind: Optional[str], ctx: str = "") -> str:
+    # 0) If the preceding context mentions office hours, that's strongest
+    if ctx and OFFICE_RE.search(ctx):
+        return "OFFICE"
+
+    # 1) Inline "Office hours" on the same line should always win
+    txt = (line_text or "")
+    if OFFICE_RE.search(txt):
+        return "OFFICE"
+
+    # 2) Section signal (next priority)
     if span_kind == "OFFICE":     return "OFFICE"
     if span_kind == "LAB":        return "LAB"
     if span_kind == "DISCUSSION": return "DISCUSSION"
-    # 2) Inline hints
-    txt = line_text or ""
-    loc = loc or ""
-    if OFFICE_RE.search(txt):              return "OFFICE"
-    if LAB_HINT_RE.search(txt) or LAB_HINT_RE.search(loc):        return "LAB"
-    if DISC_HINT_RE.search(txt) or DISC_HINT_RE.search(loc):      return "DISCUSSION"
-    if LECTURE_HINT_RE.search(txt):        return "CLASS"
-    # 3) Default
-    return "CLASS"
 
-def _iter_day_time_pairs(text: str):
-    for pm in PAIR_RE.finditer(text):
-        yield pm.group('days'), pm
+    # 3) Other inline hints
+    loc = loc or ""
+    if LAB_HINT_RE.search(txt) or LAB_HINT_RE.search(loc):   return "LAB"
+    if DISC_HINT_RE.search(txt) or DISC_HINT_RE.search(loc): return "DISCUSSION"
+    if LECTURE_HINT_RE.search(txt):                          return "CLASS"
+
+    # 4) Default
+    return "CLASS"
 
 # ----- Lab block parsing (kept for completeness) -----
 LAB_LINE_RE = re.compile(
@@ -370,19 +390,24 @@ def _parse_labs_block(text: str) -> List[Meeting]:
         if shared:
             rm = ROOM_RE.search(shared)
             if rm: shared_loc = rm.group(1)
+
         for part in body.split(";"):
             item = LAB_ITEM_RE.search(part)
-            if not item: 
+            if not item:
                 continue
             days_text = item.group("days")
             days = _explode_days(days_text)
+
             a1, a2 = item.group("a1"), item.group("a2")
             t1, t2 = item.group("t1"), item.group("t2")
             start_24h, end_24h = _resolve_range(t1, a1, t2, a2)
+
+            # try to capture a per-item room (rare), else shared "(all in HSC 109)"
             loc = None
             rm = ROOM_RE.search(part)
             if rm: loc = rm.group(1)
             if not loc: loc = shared_loc
+
             out.append(Meeting(
                 days_text=days_text,
                 days=days,
@@ -400,32 +425,6 @@ def _dedupe_meetings(meetings: List[Meeting]) -> List[Meeting]:
         if key in seen: continue
         seen.add(key); out.append(mt)
     return out
-
-def _best_location(a: Optional[str], b: Optional[str]) -> Optional[str]:
-    """Prefer a non-null, non-'TBD' location."""
-    def score(x):
-        if not x: return 0
-        if str(x).strip().upper() == "TBD": return 1
-        return 2
-    return a if score(a) >= score(b) else b
-
-def _merge_upgrade_locations(meetings: List[Meeting]) -> List[Meeting]:
-    """
-    Collapse items that share (days, start, end, kind), preferring better location.
-    This removes duplicates like one null-location CLASS and one 'TBD' (or later a room).
-    """
-    buckets: Dict[Tuple[Tuple[str, ...], str, str, str], Meeting] = {}
-    for m in meetings:
-        key = (tuple(m.days), m.start_24h, m.end_24h, m.kind)
-        if key not in buckets:
-            buckets[key] = m
-        else:
-            existing = buckets[key]
-            best_loc = _best_location(existing.location, m.location)
-            existing.location = best_loc
-            if len((m.days_text or "")) > len((existing.days_text or "")):
-                existing.days_text = m.days_text
-    return list(buckets.values())
 
 def time_makes_sense(meeting: Meeting) -> bool:
     sh, sm = map(int, meeting.start_24h.split(':'))
@@ -453,6 +452,7 @@ def parse_class_schedule(raw_text: str) -> CourseSchedule:
 
         days_text = m.group("days").strip()
         days = _explode_days(days_text)
+
         a1, a2 = m.group("a1"), m.group("a2")
         t1, t2 = m.group("t1"), m.group("t2")
         start_24h, end_24h = _resolve_range(t1, a1, t2, a2)
@@ -463,41 +463,17 @@ def parse_class_schedule(raw_text: str) -> CourseSchedule:
             if loc.upper() == "TBD":
                 loc = "TBD"
 
-        # ---- classification (use this line + a little preceding context) ----
+        # ---- classification (use this line; OFFICE inline and ctx override span) ----
         span_kind = _kind_at(m.start(), kind_spans)   # where the match occurs
-        prev_ctx_start = max(0, line_start - 200)
+        prev_ctx_start = max(0, line_start - CONTEXT_WINDOW_CHARS)
         prev_ctx = text[prev_ctx_start:line_start]
-        kind = _classify_kind(prev_ctx + "\n" + line_text, loc, span_kind)
+        kind = _classify_kind(line_text, loc, span_kind, prev_ctx)
 
         meetings.append(Meeting(days_text, days, start_24h, end_24h, loc, kind))
 
-        # --- handle extra ranges on the SAME line ONLY (no spill to next line) ---
-        first_range_text = m.group("trange")
-        first_pos = line_text.find(first_range_text)
-        tail_same_line = (line_text[first_pos + len(first_range_text):] if first_pos != -1 else "")
-
-        next_line = ""
-        nl_pos = line_end + 1
-        nl2_pos = text.find("\n", nl_pos)
-        if nl_pos < len(text):
-            next_line = text[nl_pos:(len(text) if nl2_pos == -1 else nl2_pos)].strip()
-
-        tail = tail_same_line
-        if next_line and not _skip_nonclass_line(next_line):
-            # IMPORTANT: don't borrow across days; just add as context to parse pairs
-            tail = f"{tail} {next_line}"
-
-        if _has_days(tail):
-            # Tail has more day tokens → bind each time to its own day(s)
-            for dtxt, mm in _iter_day_time_pairs(tail):
-                d2 = _explode_days(dtxt)
-                s2, e2 = _resolve_range(mm.group('t1'), mm.group('a1'), mm.group('t2'), mm.group('a2'))
-                meetings.append(Meeting(dtxt, d2, s2, e2, loc, kind))
-        else:
-            # Tail has no additional days → safe to clone times with original day(s)
-            for mm in _gather_extra_ranges(tail):
-                s2, e2 = _resolve_range(mm.group('t1'), mm.group('a1'), mm.group('t2'), mm.group('a2'))
-                meetings.append(Meeting(days_text, days, s2, e2, loc, kind))
+        # IMPORTANT: We intentionally DO NOT scan for "extra ranges" on the same/next line,
+        # because that tends to pair a day from one line with a time from another,
+        # creating incorrect day-time combos and duplicates.
 
     # ---- Pass B: fallback line-pair stitching with positions ----
     for days_text, mt, loc, start_off, synth_line in _fallback_line_pairs_with_pos(text):
@@ -514,9 +490,9 @@ def parse_class_schedule(raw_text: str) -> CourseSchedule:
 
         # classification for fallback (use preceding context around the days line)
         span_kind = _kind_at(start_off, kind_spans)
-        prev_ctx_start = max(0, start_off - 200)
+        prev_ctx_start = max(0, start_off - CONTEXT_WINDOW_CHARS)
         prev_ctx = text[prev_ctx_start:start_off]
-        kind = _classify_kind(prev_ctx + "\n" + synth_line, loc, span_kind)
+        kind = _classify_kind(synth_line, loc, span_kind, prev_ctx)
 
         meetings.append(Meeting(days_text, days, start_24h, end_24h, loc, kind))
 
@@ -524,11 +500,7 @@ def parse_class_schedule(raw_text: str) -> CourseSchedule:
     meetings = [m for m in meetings if time_makes_sense(m)]
     meetings = _dedupe_meetings(meetings)
 
-    # merge duplicates with same (days, time, kind) and upgrade location
-    meetings = _merge_upgrade_locations(meetings)
-
     return CourseSchedule(course_name=_guess_course_name(text), meetings=meetings)
-
 
 # Helpers
 def meetings_to_rrule(meet: Meeting, dtstart_ymd: str) -> Dict[str, Any]:
